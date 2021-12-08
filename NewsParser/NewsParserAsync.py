@@ -1,41 +1,66 @@
 import datetime
-import operator
-
+from progress.bar import IncrementalBar
 from bs4 import BeautifulSoup
 import time
 import csv
 import asyncio
 import aiohttp
-import pymongo
+import Config
 
-MONGO = "mongodb+srv://admin:admin@cluster0.bwhk4.mongodb.net/myFirstDatabase?retryWrites=true&w=majority"
-URL = "https://v1.ru/text/"
-HEADERS = {
-    "Accept": "text / html, application / xhtml + xml, application / xml; q = 0.9, image / avif, image / webp, * / *;q = 0.8",
-    "User-Agent": "Mozilla / 5.0(Windows NT 10.0; Win64; x64; rv: 94.0) Gecko / 20100101 Firefox / 94.0"
-}
-PATH = "news_async.csv"
-ID = 1
 
-async def getPageData(session, page, pagesCount, news):
-    async with session.get(url=f"{URL}?page={page}", headers=HEADERS) as response:
+soupSourcesId = 0
+
+
+async def getPageData(session, page, pagesCount, news, retry=5):
+    try:
+        response = await session.get(url=f"{Config.URL}?page={page}", headers=Config.HEADERS)
+        while response.status != 200:
+            time.sleep(3)
+            response = await session.get(url=f"{Config.URL}?page={page}", headers=Config.HEADERS)
         responseText = await response.text()
-        await parsePage(session, news, responseText)
-        print(f"[INFO] Парсинг страницы {pagesCount + 1 - page} из {pagesCount}")
+        print("")
+        await parsePage(session, news, responseText, page, pagesCount)
+        if Config.SAVE_EVERY != 0 and page % Config.SAVE_EVERY == 0:
+            saveCSV(news, f"{Config.PATH}/news{page // Config.SAVE_EVERY}.csv")
+            news.clear()
+    except Exception as ex:
+        if retry > 0:
+            print(f"[{currentTime()}] [WARNING] Не удается загрузить страницу {page}")
+            print(f"[{currentTime()}] [WARNING] Попытка переподключения {6 - retry} из 5")
+            time.sleep(5)
+            await getPageData(session, page, pagesCount, news, retry-1)
+        else:
+            print(f"[{currentTime()}] [ERROR] {ex}")
 
 
 async def gatherData(news):
-    async with aiohttp.ClientSession() as session:
+    connector = aiohttp.TCPConnector(limit=50, force_close=True)
+    async with aiohttp.ClientSession(connector=connector) as session:
         # Определяем кол-во страниц
-        response = await session.get(url=URL, headers=HEADERS)
+        response = await session.get(url=Config.URL, headers=Config.HEADERS)
+        while response.status != 200:
+            time.sleep(3)
+            response = await session.get(url=Config.URL, headers=Config.HEADERS)
         responseText = await response.text()
         soup = BeautifulSoup(responseText, "html.parser")
-        paginationBar = soup.find("div", "HRahz PZm3")
-        pagesCount = int(paginationBar.findAll("div", "HRah1")[-1].getText(strip=True))
+
+        ## Определяем нужный набор классов для парсинга
+        paginationBar = None
+        global soupSourcesId
+        while paginationBar is None and soupSourcesId < len(Config.soupSources):
+            paginationBar = soup.find("div", Config.soupSources[soupSourcesId]["PaginationBar"])
+            soupSourcesId += 1
+        if paginationBar is None:
+            print(f"[{currentTime()}] [ERROR] Названия классов изменились. Парсинг невозможен!")
+            return None
+        soupSourcesId -= 1
+        pagesCount = int(paginationBar.findAll("div", Config.soupSources[soupSourcesId]["Pages"])[-1].getText(strip=True))
+        if Config.END == 0 or Config.END > pagesCount:
+            Config.END = pagesCount + 1
 
         # Парсим все страницы
         tasks = []
-        for page in range(pagesCount, 0, -1):
+        for page in range(Config.START, Config.END):
             task = asyncio.create_task(getPageData(session, page, pagesCount, news))
             tasks.append(task)
 
@@ -44,65 +69,54 @@ async def gatherData(news):
 
 # Парсинг нвостей с сайта V1.RU
 def main():
-    try:
-        startTime = time.time()
-        news = []
-        asyncio.get_event_loop().run_until_complete(gatherData(news))
-        endTime = time.time()
-        print(f"[INFO] Прошло времени: {endTime - startTime} сек")
+    news = []
 
-        # Сохраняем данные в базу данных (обновляем старые)
-        print(f"[INFO] Сохранение в БД...")
-        client = pymongo.MongoClient(MONGO)
-        db = client.V1News
-        coll = db.news
-        docs_count = coll.count_documents({})
-
-        ## Сортируем список по датам
-        news.sort(key=operator.itemgetter("Date"))
-        for i in range(0, len(news)):
-            news[i]["_id"] = i + 1
-
-        for id in range(1, len(news) + 1):
-            if id > docs_count:
-                coll.insert_one(news[id - 1])
-            else:
-                current = {"Id": id}
-                new = {"$set": {"Views": news[id - 1]["Views"],
-                                "Comments": news[id - 1]["Comments"]}}
-                coll.update_one(current, new)
-        print("[INFO] Успешно!")
-    except Exception as ex:
-        print(f"[ERROR] {ex}")
+    startTime = time.time()
+    print(f"[{currentTime()}] [INFO] Подготовка к парсингу")
+    policy = asyncio.WindowsSelectorEventLoopPolicy()
+    asyncio.set_event_loop_policy(policy)
+    asyncio.get_event_loop().run_until_complete(gatherData(news))
+    endTime = time.time()
+    print(f"[{currentTime()}] [INFO] Прошло времени: {endTime - startTime} сек")
+    saveCSV(news, Config.PATH)
+    print(f"[{currentTime()}] [INFO] Успешно!")
 
 
-async def parsePage(session, news: list, html):
+async def parsePage(session, news: list, html, pageNumber, pagesCount):
     HOST = "https://v1.ru"
     soup = BeautifulSoup(html, "html.parser")
-    items = soup.findAll("article", "IJamp")
+    items = soup.findAll("article", Config.soupSources[soupSourcesId]["Articles"])
+    bar = IncrementalBar(f"[{currentTime()}] [INFO] Парсинг страницы {pageNumber} из {pagesCount}", max=len(items) * 7)
     for item in reversed(items):
-        heading = None; date = None; link = None; views = None; comments = None;    # очищаем переменные
-        heading = item.find("h2", "IJm9").getText(strip=True)                       # получаем название новости
-        if item.find("div", "IJal3") is None:                                       # eсли нет краткого описания,
-            continue                                                                #   значит, это просто реклама - пропускаем ее,
-        else:                                                                       # иначе получаем краткое описание новости
-            description = item.find("div", "IJal3").getText(strip=True)
+        heading = None; date = None; link = None; views = None; comments = None;                        # очищаем переменные
+        heading = item.find("h2", Config.soupSources[soupSourcesId]["Heading"]).getText(strip=True)     # получаем название новости
+        bar.next()
+        if item.find("div", Config.soupSources[soupSourcesId]["Description"]) is None:                  # eсли нет краткого описания,
+            continue                                                                                    #   значит, это просто реклама - пропускаем ее,
+        else:                                                                                           # иначе получаем краткое описание новости
+            description = item.find("div", Config.soupSources[soupSourcesId]["Description"]).getText(strip=True)
+        bar.next()
         date = datetime.datetime\
-            .fromisoformat(item.find("div", "IJain IJam-")                          # получаем дату
+            .fromisoformat(item.find("div", Config.soupSources[soupSourcesId]["Date"])                  # получаем дату
                                 .find("time").get("datetime"))
-        link = item.find("h2", "IJm9").find("a").get("href")                        # получаем ссылку на статью
-        if link.find("v1.ru") == -1:                                                # если ссылка не содержит в себе хоста,
-            link = HOST + link                                                      #   то добавляем его
-        content = await parseNewsContent(session, link)                                   # парсим содержимое статьи
-        stats = item.findAll("span", "H3gt")                                        # получаем данные о просмотрах и комментариях
+        bar.next()
+        link = item.find("h2", Config.soupSources[soupSourcesId]["Heading"]).find("a").get("href")      # получаем ссылку на статью
+        if link.find("v1.ru") == -1:                                                                    # если ссылка не содержит в себе хоста,
+            link = HOST + link                                                                          #   то добавляем его
+        bar.next()
+        content = await parseNewsContent(session, link)                                                 # парсим содержимое статьи
+        bar.next()
+        stats = item.findAll("span", Config.soupSources[soupSourcesId]["Stats"])                        # получаем данные о просмотрах и комментариях
         views = stats[0].getText(strip=True)
-        if len(stats) < 2 or stats[1].getText(strip=True).find("Обсудить") != -1:   # если комментариев еще нет,
-            comments = ""                                                           #   записываем пустую строку
-        else:                                                                       # иначе парсим кол-во комментариев
+        bar.next()
+        if len(stats) < 2 or stats[1].getText(strip=True).find("Обсудить") != -1:                       # если комментариев еще нет,
+            comments = ""                                                                               #   записываем пустую строку
+        else:                                                                                           # иначе парсим кол-во комментариев
             comments = stats[1].getText(strip=True)
-        global ID
-        news.append({                                                               # добавляем все данные о статье в список
-            "_id": ID,
+        bar.next()
+
+        news.append({                                                                                   # добавляем все данные о статье в список
+            "_id": Config.ID,
             "Heading": heading,
             "Description": description,
             "Date": date,
@@ -111,16 +125,21 @@ async def parsePage(session, news: list, html):
             "Views": views,
             "Comments": comments
         })
-        ID += 1
+        Config.ID += 1
+        bar.finish()
 
 
 # Парсинг содержимого статьи
 async def parseNewsContent(session, URL):
-    async with session.get(url=URL, headers=HEADERS) as response:
+    async with session.get(url=URL, headers=Config.HEADERS) as response:
+        while response.status != 200:
+            time.sleep(3)
+            response = await session.get(url=URL, headers=Config.HEADERS)
         responseText = await response.text()
         soup = BeautifulSoup(responseText, "html.parser")
         try:
-            contentList = soup.find("div", "I5pv").findAll("div", "INant")  # находим все абзацы статьи
+            contentList = soup.find("div", Config.soupSources[soupSourcesId]["ContentAll"])\
+                .findAll("div", Config.soupSources[soupSourcesId]["ContentPar"])    # находим все абзацы статьи
         except:
             contentList = []
         result = ""
@@ -136,6 +155,11 @@ def saveCSV(newsList: list, path: str):
         writer.writerow(["Заголовок", "Описание", "Дата", "Ссылка", "Содержание", "Количество просмотров", "Количество комментариев"])
         for news in newsList:
             writer.writerow([news["Heading"], news["Description"], news["Date"], news["Link"], news["Content"], news["Views"], news["Comments"]])
+
+
+# Получение текущего времени в виде строки
+def currentTime():
+    return datetime.datetime.now().strftime("%H:%M:%S")
 
 
 if __name__ == '__main__':
