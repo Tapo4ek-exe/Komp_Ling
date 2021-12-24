@@ -1,0 +1,5 @@
+import "base.proto";
+import "articles_base.proto";
+
+message PersonsNames : TAuxDicArticle {}
+message AttractionsNames : TAuxDicArticle {}

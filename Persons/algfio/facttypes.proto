@@ -1,0 +1,16 @@
+import "base.proto";
+import "facttypes_base.proto";
+
+message Person: NFactType.TFact
+{
+    required string Name = 1;
+
+//    required NFactType.TFio Name = 1;
+}
+
+message AttractionObj: NFactType.TFact
+{
+    required string Name = 1;
+
+//    required NFactType.TFio Name = 1;
+}

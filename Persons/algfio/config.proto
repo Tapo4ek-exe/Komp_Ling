@@ -1,0 +1,24 @@
+encoding "utf8";
+
+TTextMinerConfig {
+  Dictionary = "./algfio/mydic.gzt";
+
+  Input = {
+    File = "./algfio/test.txt";
+  }
+
+  Articles = [
+    { Name = "People" },
+    { Name = "Attraction" }
+  ]
+
+  Facts = [
+    { Name = "Person" },
+    { Name = "AttractionObj" }
+  ]
+
+  Output = {
+    File = "./algfio/facts.txt";
+    Format = text;
+  }
+}
